@@ -475,7 +475,10 @@ def CTD_to_xarray(
 
     def _all_convertible_to_float(arr) -> bool:
         try:
-            data = arr.compressed()
+            if isinstance(arr, np.ma.MaskedArray):
+                data = arr.compressed()
+            else:
+                data = arr
             np.array(data, dtype=float)
             return True
         except (ValueError, TypeError):
@@ -510,6 +513,7 @@ def CTD_to_xarray(
     # construct the X-vector
     X: np.ndarray = np.array([d["datetime"] for d in CTD.values()])
 
+    # extract all variables
     fields: list = list(
         set(
             [
@@ -519,7 +523,6 @@ def CTD_to_xarray(
             ]
         )
     )
-
     fCTD: dict = {}
     interset: set[str] = (
         set()
@@ -528,6 +531,7 @@ def CTD_to_xarray(
         # grid over Z
         temp_array: list = []
         for value in CTD.values():
+            
             if field in value:
                 if _all_convertible_to_float(value[field]):
                     temp_array.append(
@@ -595,7 +599,9 @@ def CTD_to_xarray(
     ds["OX"].attrs["long_name"] = "Oxygen"
     ds["bottom_depth"].attrs["units"] = "m"
     ds["depth"].attrs["units"] = "m"
-
+    ds["Lt"].attrs["long_name"] = "Thorpe Length"
+    ds["thorpe_disp"].attrs["long_name"] = "Thorpe Displacement"
+    
     ds.attrs = {"source": "CTD_to_xarray"}
 
     return ds
@@ -634,6 +640,7 @@ def section_to_xarray(
     stations: list = None,
     time_periods: list = None,
     ship_speed_threshold: float = 1.0,
+    direction: str = None,
 ) -> xr.Dataset:
     """Function to extract one section from the CTD/ADCP dataset from the whole cruise and return a new dataset, where distance along the section is the new dimension.
 
@@ -642,7 +649,7 @@ def section_to_xarray(
         stations (list, optional): List with the UNIS station numbers in the section. This is used for CTD and LADCP. Defaults to None.
         time_periods (list, optional): List with the start and end points for each time period that contributes to the section. This is used for the VM-ADCPs. Defaults to None.
         ship_speed_threshold (float, optional): Threshold value for the ship speed (m/s) for use of VM-ADCP. Data during times with ship speeds lower than the threshold will be discarded. Only applies for VM-ADCP. Defaults to 1.0.
-
+        direction: order stations from west to east ('WE') or from north to south 'NE'. If none, chronological
     Returns:
         xr.Dataset: Dataset with two dimensions depth and distance along the section, and all measured variables.
     """
@@ -660,7 +667,11 @@ def section_to_xarray(
                 ds_section.append(ds.sel(time=slice(start, end)))
             elif start > end:
                 ds_section.append(ds.sel(time=slice(end, start)))
-        ds_section = xr.concat(ds_section, dim="time")
+        if direction == 'WE':
+            ds_section = xr.concat(ds_section, dim="time").sortby('lon')
+        elif direction == 'NS':
+            ds_section = xr.concat(ds_section, dim="time").sortby('lat', ascending=False)
+        else: ds_section = xr.concat(ds_section, dim="time")
         if len(time_periods) == 1:
             if time_periods[0][0] > time_periods[0][-1]:
                 ds_section = ds_section.sortby("time", ascending=False)
@@ -701,7 +712,12 @@ def section_to_xarray(
                 "There are duplicate station numbers in the dataset. Using the first occurrence of each station."
             )
             ds = ds.drop_duplicates("station", keep="first")
-        ds_section = ds.sel(station=stations)
+        if direction == 'WE':
+            ds_section = ds.sel(station=stations).sortby('lon')
+        elif direction == 'NS':
+            ds_section = ds.sel(station=stations).sortby('lat', ascending=False)
+        else:
+            ds_section = ds.sel(station=stations)
         ds_section["distance"] = xr.DataArray(
             np.insert(
                 np.cumsum(
@@ -2074,6 +2090,7 @@ def VMADCP_calculate_crossvel(ds: xr.Dataset) -> xr.Dataset:
     calc_crossvel = lambda u, v, angle_deg: v * np.sin(
         np.deg2rad(angle_deg)
     ) - u * np.cos(np.deg2rad(angle_deg))
+    
     ds["crossvel"] = xr.apply_ufunc(
         calc_crossvel, ds["u_detide"], ds["v_detide"], ds["Heading_ship"]
     )
@@ -2082,6 +2099,20 @@ def VMADCP_calculate_crossvel(ds: xr.Dataset) -> xr.Dataset:
     ds["crossvel"].attrs[
         "long_name"
     ] = "Current velocity (detided) perpendicular to the ship track"
+
+    # calculate parallel velocity too
+    calc_alongvel = lambda u, v, angle_deg: u * np.sin(
+        np.deg2rad(angle_deg)
+    ) + v * np.cos(np.deg2rad(angle_deg))
+
+    ds["alongvel"] = xr.apply_ufunc(
+        calc_alongvel, ds["u_detide"], ds["v_detide"], ds["Heading_ship"]
+    )
+    ds["alongvel"].attrs["name"] = "alongvel"
+    ds["alongvel"].attrs["units"] = "m/s"
+    ds["alongvel"].attrs[
+        "long_name"
+    ] = "Current velocity (detided) parallel to the ship track"
 
     return ds
 
@@ -5605,12 +5636,12 @@ def plot_xarray_sections(
     if add_station_ticks:
         found_stations = False
         i = 0
-        while (found_stations == False) & (i < len(list_das)):
-            if "station" in list_das[i].coords:
-                stations = list_das[i]["station"].to_numpy()
-                distances = list_das[i]["distance"].to_numpy()
-                found_stations = True
-            i += 1
+        #while (found_stations == False) & (i < len(list_das)):
+        #    if "station" in list_das[i].coords:
+        #        stations = list_das[i]["station"].to_numpy()
+        #        distances = list_das[i]["distance"].to_numpy()
+        #        found_stations = True
+        #    i += 1
         if (found_stations == False) & (da_contours is not None):
             if "station" in da_contours.coords:
                 stations = da_contours["station"].to_numpy()
@@ -6414,7 +6445,7 @@ def check_VM_ADCP_map(ds: xr.Dataset) -> None:
     df["time"] = df.index
 
     # deprecated!!!
-    fig = px.scatter_map(
+    fig = px.scatter_mapbox(
         df,
         "lat",
         "lon",
